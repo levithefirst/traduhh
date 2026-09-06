@@ -31,9 +31,16 @@ def run_migrations(conn: psycopg.Connection) -> list[str]:
         if version in applied:
             continue
         sql = path.read_text(encoding="utf-8")
+        # Each migration file brackets itself with its own BEGIN;/COMMIT;, so it
+        # must run un-nested: wrapping it in another conn.transaction() causes
+        # the file's own COMMIT to close the transaction psycopg's Transaction
+        # object still believes it owns, and it fails releasing a savepoint
+        # that no longer exists. The bookkeeping insert gets its own separate
+        # transaction instead.
+        with conn.cursor() as cur:
+            cur.execute(sql)
         with conn.transaction():
             with conn.cursor() as cur:
-                cur.execute(sql)
                 cur.execute("INSERT INTO schema_migrations(version) VALUES (%s)", (version,))
         applied_now.append(version)
     return applied_now

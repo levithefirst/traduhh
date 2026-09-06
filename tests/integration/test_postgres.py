@@ -23,7 +23,22 @@ def test_postgres_migrations_and_constraints():
                 cur.execute("SELECT 1 FROM pg_constraint WHERE conname = 'candles_venue_asset_timeframe_open_time_key'")
                 assert cur.fetchone() is not None
 
-                cur.execute("SELECT 1 FROM pg_constraint WHERE conname = 'ideas_asset_timeframe_setup_id_bar_open_time_strategy_version_id_key'")
-                assert cur.fetchone() is not None
+                # Postgres auto-names a multi-column UNIQUE constraint by
+                # concatenating every column plus a "_key" suffix, then
+                # truncates to its 63-byte identifier limit. That truncated
+                # name is what actually exists in the catalog (verified
+                # against a live instance), not the untruncated concatenation
+                # spec 20.2 writes out for readability, so the columns
+                # themselves are checked here instead of a guessed name.
+                cur.execute(
+                    """SELECT array_agg(a.attname ORDER BY a.attnum)
+                       FROM pg_constraint c
+                       JOIN pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = ANY(c.conkey)
+                       WHERE c.conrelid = 'ideas'::regclass AND c.contype = 'u'
+                       GROUP BY c.oid"""
+                )
+                row = cur.fetchone()
+                assert row is not None
+                assert set(row[0]) == {"asset", "timeframe", "setup_id", "bar_open_time", "strategy_version_id"}
     except psycopg.OperationalError as exc:
         pytest.skip(f"PostgreSQL unavailable: {exc}")
