@@ -93,3 +93,21 @@ The specification's later `scan_event` / `scan_events` reference remains unresol
 Step 5 is a source reconstruction from the recovered Step 4 tree and frozen v1 specification. The original Step 5 commit was not recovered. This reconstruction adds only the three specified setup detectors, deterministic geometry/cost/gate evaluation, deterministic idea identity, existing `ideas` persistence, and closed-bar scan integration. No Step 6 lifecycle or Step 7 Telegram layer is included.
 
 The specification requires a 4h regime for 15m/1h gating but does not define an exact directional cross-timeframe acceptance predicate. The reconstruction therefore records the latest persisted 4h regime and conservatively blocks when that regime is unavailable/UNKNOWN/PANIC/EVENT_HIGH, without inventing a directional alignment rule.
+
+## Part 18 Step 6: paper monitoring and outcomes
+
+Step 6 adds only the frozen Part 13 paper contract on top of the existing schema and scheduler:
+
+- immediate hypothetical entry fill for a `TRADE_PAPER` idea (`paper.py`): `min(ask1, close)` / `max(bid1, close)` plus modeled slippage, falling back to `close * (1 ± slip_bps/1e4)` when the book is missing
+- adverse stop-fill slippage; the Step 5 target level itself with no added slippage; time-stop and halt-flatten fills at the bar close
+- deterministic, restart-safe bar walking (`monitor.py`): MFE/MAE and the first exit condition are recomputed from stored closed candles on every tick rather than mutated incrementally, so a duplicate tick or a crash mid-tick can never double-count or double-exit a position; same-candle target+stop resolves STOP first
+- realized R, fees, and funding computed from the actual modeled fills, never from the idealized signal entry; funding is summed from real hourly `asset_ctx` rows with the correct directional sign, and any hour with no funding data is flagged (`funding_missing`) rather than assumed zero
+- durable `paper_equity` snapshots (equity, open risk, drawdown from a peak tracked in `system_state`)
+- migration `0002_step6_paper_contract.sql` adds the uniqueness the spec's restart-recovery rule requires: one paper position per idea, one fill per `(position, kind)`
+- `monitor_open` (15s) and `equity_snap` (1 min) run on the existing Step 3 APScheduler/worker process; no new worker, service, or queue was introduced
+
+Step 6 does not change how an idea's `decision` becomes `TRADE_PAPER` — that transition is the Step 8 LLM veto layer, which remains unbuilt. `paper.py` only reacts to ideas that already carry that decision, so it is exercised today through the Step 6 test suite's synthetic `TRADE_PAPER` ideas and is ready to receive real ones once Step 8 exists.
+
+`tests/unit/test_step6.py` covers the entry/stop/exit fill math, MFE/MAE, same-candle stop-wins, time-stop, halt-flatten, no-lookahead, realized R, funding (including the missing-data flag), and equity/drawdown as pure, DB-free functions. `tests/integration/test_step6_postgres.py` covers position creation, duplicate prevention, and restart idempotency against a real PostgreSQL instance; like the Step 1 integration test it is skipped (not faked) when `DATABASE_URL` is unset, which is the case in this environment.
+
+No Step 7 Telegram layer, LLM integration, execution, or wallet/order-signing code exists.

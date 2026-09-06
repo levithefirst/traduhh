@@ -13,6 +13,7 @@ from agent.features import FeatureWarmupError, compute_and_persist_latest
 from agent.pipeline import scan_closed_bar
 from agent.integrity import inspect_latest_market_data
 from agent.models import audit_event, claim_job, finish_job, record_ctx_health, recover_running_jobs
+from agent.monitor import run_equity_snap_job, run_monitor_open_job
 from agent.timeutil import require_utc, utc_now
 from agent.logging_setup import configure_logging
 
@@ -40,7 +41,11 @@ def scheduled_for(job_name: str, now: datetime | None = None) -> datetime:
     if job_name == "candle_4h":
         base_hour = (current.hour // 4) * 4
         return current.replace(hour=base_hour, minute=0, second=8, microsecond=0)
-    raise ValueError(f"unsupported Step 3 scheduler job: {job_name}")
+    if job_name == "monitor_open":
+        return _slot(current, 15)
+    if job_name == "equity_snap":
+        return current.replace(second=0, microsecond=0)
+    raise ValueError(f"unsupported scheduler job: {job_name}")
 
 
 def run_scheduled_job(
@@ -158,6 +163,16 @@ def _market_callbacks(settings, client):
                         )
             return {"ok": result.ok, "halt": result.halt, "flags": list(result.flags)}
 
+    def monitor_open_job() -> dict:
+        from agent.db import connect
+        with connect(settings.database_url) as conn:
+            return run_monitor_open_job(conn, settings=settings)
+
+    def equity_snap_job() -> dict:
+        from agent.db import connect
+        with connect(settings.database_url) as conn:
+            return run_equity_snap_job(conn, settings=settings)
+
     return {
         "ctx_poll": ctx_poll,
         "book_poll": book_poll,
@@ -165,6 +180,8 @@ def _market_callbacks(settings, client):
         "candle_1h": candle_job("1h"),
         "candle_4h": candle_job("4h"),
         "integrity": integrity_job,
+        "monitor_open": monitor_open_job,
+        "equity_snap": equity_snap_job,
     }
 
 
@@ -194,6 +211,8 @@ def build_scheduler(settings, client):
     add("candle_1h", CronTrigger(minute=0, second=8, timezone=timezone.utc))
     add("candle_4h", CronTrigger(hour="0,4,8,12,16,20", minute=0, second=8, timezone=timezone.utc))
     add("integrity", IntervalTrigger(seconds=30, timezone=timezone.utc))
+    add("monitor_open", IntervalTrigger(seconds=15, timezone=timezone.utc))
+    add("equity_snap", IntervalTrigger(seconds=60, timezone=timezone.utc))
     return scheduler
 
 
@@ -212,8 +231,8 @@ def main() -> int:
         recovered = recover_running_jobs(conn)
     LOGGER.info("startup_ok", extra={"event": "startup_ok", "migrations_applied": applied, "recovered_jobs": recovered})
 
-    # Step 3 deliberately starts only the market-data and integrity skeleton. Later
-    # feature, setup, paper, Telegram, and LLM jobs are not registered yet.
+    # Market-data/integrity (Step 3) and paper monitoring (Step 6) share this one
+    # worker/scheduler. Telegram and LLM jobs are not registered yet.
     from agent.hl_client import HyperliquidClient
 
     client = HyperliquidClient(settings.hl_info_url)
