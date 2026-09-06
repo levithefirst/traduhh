@@ -222,6 +222,36 @@ def _run_job_from_scheduler(settings, job_name: str, callback: Callable[[], dict
         run_scheduled_job(conn, job_name, callback)
 
 
+def start_telegram_listener(settings) -> tuple[object, Callable[[], None]]:
+    """Telegram long-poll listener on a thread inside this same worker (spec 1.1)."""
+    import threading
+
+    from agent.db import connect
+    from agent.telegram.bot import Dispatcher, TelegramTransport, poll_once
+
+    transport = TelegramTransport(settings.telegram_bot_token)
+    dispatcher = Dispatcher(settings, conn_factory=lambda: connect(settings.database_url))
+    stop = threading.Event()
+
+    def loop() -> None:
+        offset: int | None = None
+        while not stop.is_set():
+            try:
+                offset = poll_once(transport, dispatcher, offset)
+            except Exception:
+                LOGGER.exception("telegram_listener_error", extra={"event": "telegram_listener_error"})
+                stop.wait(5)
+
+    thread = threading.Thread(target=loop, name="telegram-listener", daemon=True)
+    thread.start()
+
+    def shutdown() -> None:
+        stop.set()
+        transport.close()
+
+    return thread, shutdown
+
+
 def main() -> int:
     from agent.db import connect, startup_check
     settings = load_settings()
@@ -238,6 +268,7 @@ def main() -> int:
     client = HyperliquidClient(settings.hl_info_url)
     scheduler = build_scheduler(settings, client)
     scheduler.start()
+    _, stop_telegram = start_telegram_listener(settings)
     try:
         # APScheduler owns the process in the final worker; keep the skeleton alive.
         import time
@@ -246,6 +277,7 @@ def main() -> int:
     except KeyboardInterrupt:
         return 0
     finally:
+        stop_telegram()
         scheduler.shutdown(wait=False)
         client.close()
 
