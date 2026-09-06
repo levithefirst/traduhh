@@ -75,20 +75,118 @@ def _freshness(now: datetime, row: dict[str, Any] | None) -> float | None:
     return max(0.0, (require_utc(now) - require_utc(row["ts"])).total_seconds())
 
 
-def _persist_idea(conn, *, idea_id, target, detection, geometry, costs, gates, features, regime, ctx, book, decision, reasons, strategy_version_id):
+def _persist_idea(conn, *, idea_id, target, detection, geometry, costs, gates, features, regime, ctx, book, decision, reasons, strategy_version_id, llm_review=None, prompt_version_id=None, confidence=None, code_decision_before_llm=None, code_would_take=False, llm_involved=False):
     payload = {"setup_id": detection.setup_id, "direction": detection.direction, "evidence": detection.evidence}
     packet_hash = hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str).encode()).hexdigest()
+    if confidence is None:
+        confidence = float(regime.get("confidence", 0) or 0)
     with conn.transaction():
         with conn.cursor() as cur:
-            cur.execute("""INSERT INTO ideas(id,created_at,asset,timeframe,direction,setup_id,strategy_version_id,prompt_version_id,bar_open_time,decision,decision_reason,gates,geometry,costs,features,regime,ctx,book,news,calendar,hist_cell,llm_review,packet_hash,data_quality,confidence)
-            VALUES (%s,%s,%s,%s,%s,%s,%s,NULL,%s,%s,%s,%s::jsonb,%s::jsonb,%s::jsonb,%s::jsonb,%s::jsonb,%s::jsonb,%s::jsonb,'[]'::jsonb,'[]'::jsonb,'{}'::jsonb,NULL,%s,%s::jsonb,%s)
-            ON CONFLICT (asset,timeframe,setup_id,bar_open_time,strategy_version_id) DO UPDATE SET decision=EXCLUDED.decision,decision_reason=EXCLUDED.decision_reason,gates=EXCLUDED.gates,geometry=EXCLUDED.geometry,costs=EXCLUDED.costs,features=EXCLUDED.features,regime=EXCLUDED.regime,ctx=EXCLUDED.ctx,book=EXCLUDED.book,packet_hash=EXCLUDED.packet_hash,data_quality=EXCLUDED.data_quality,confidence=EXCLUDED.confidence""",
-            (str(idea_id),utc_now(),detection.asset,detection.timeframe,detection.direction,detection.setup_id,strategy_version_id,target,decision,reasons,
-             json.dumps({"hard":gates.hard,"soft":gates.soft},separators=(",",":")),json.dumps(geometry.to_dict(),separators=(",",":")),json.dumps(costs.to_dict(),separators=(",",":")),json.dumps(features,separators=(",",":"),default=str),json.dumps(regime,separators=(",",":"),default=str),json.dumps(ctx,separators=(",",":"),default=str),json.dumps(book,separators=(",",":"),default=str),packet_hash,json.dumps({"lookahead_protected":True},separators=(",",":")),float(regime.get("confidence",0) or 0)))
+            cur.execute("""INSERT INTO ideas(id,created_at,asset,timeframe,direction,setup_id,strategy_version_id,prompt_version_id,bar_open_time,decision,decision_reason,gates,geometry,costs,features,regime,ctx,book,news,calendar,hist_cell,llm_review,packet_hash,data_quality,confidence,code_decision_before_llm,code_would_take,llm_involved)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb,%s::jsonb,%s::jsonb,%s::jsonb,%s::jsonb,%s::jsonb,%s::jsonb,'[]'::jsonb,'[]'::jsonb,'{}'::jsonb,%s::jsonb,%s,%s::jsonb,%s,%s,%s,%s)
+            ON CONFLICT (asset,timeframe,setup_id,bar_open_time,strategy_version_id) DO UPDATE SET decision=EXCLUDED.decision,decision_reason=EXCLUDED.decision_reason,gates=EXCLUDED.gates,geometry=EXCLUDED.geometry,costs=EXCLUDED.costs,features=EXCLUDED.features,regime=EXCLUDED.regime,ctx=EXCLUDED.ctx,book=EXCLUDED.book,packet_hash=EXCLUDED.packet_hash,data_quality=EXCLUDED.data_quality,confidence=EXCLUDED.confidence,llm_review=EXCLUDED.llm_review,prompt_version_id=EXCLUDED.prompt_version_id,code_decision_before_llm=EXCLUDED.code_decision_before_llm,code_would_take=EXCLUDED.code_would_take,llm_involved=EXCLUDED.llm_involved""",
+            (str(idea_id),utc_now(),detection.asset,detection.timeframe,detection.direction,detection.setup_id,strategy_version_id,prompt_version_id,target,decision,reasons,
+             json.dumps({"hard":gates.hard,"soft":gates.soft},separators=(",",":")),json.dumps(geometry.to_dict(),separators=(",",":")),json.dumps(costs.to_dict(),separators=(",",":")),json.dumps(features,separators=(",",":"),default=str),json.dumps(regime,separators=(",",":"),default=str),json.dumps(ctx,separators=(",",":"),default=str),json.dumps(book,separators=(",",":"),default=str),
+             json.dumps(llm_review,separators=(",",":"),default=str) if llm_review is not None else None,
+             packet_hash,json.dumps({"lookahead_protected":True},separators=(",",":")),float(confidence),
+             code_decision_before_llm,bool(code_would_take),bool(llm_involved)))
     return packet_hash
 
 
-def evaluate(conn, *, settings, asset: str, timeframe: str, bar_open_time: datetime | None = None) -> list[dict[str, Any]]:
+MIN_FINAL_CONFIDENCE = 0.35
+FUNDING_WAIT_MINUTES = 5
+
+
+def _hist_cell(conn, *, asset: str, timeframe: str, setup_id: str, regime_primary) -> dict[str, Any]:
+    """Historical cell support for this candidate (spec 10 step 4/14).
+
+    Reports only what closed paper positions actually show. A thin cell is
+    labelled unproven; it is never presented as an edge.
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            """SELECT count(*), avg(p.realized_r), stddev_samp(p.realized_r),
+                      avg(CASE WHEN p.realized_r > 0 THEN 1.0 ELSE 0.0 END)
+               FROM paper_positions p JOIN ideas i ON i.id = p.idea_id
+               WHERE p.status='CLOSED' AND i.asset=%s AND i.timeframe=%s AND i.setup_id=%s""",
+            (asset, timeframe, setup_id),
+        )
+        row = cur.fetchone()
+    n = int(row[0] or 0)
+    note = "unproven" if n < 30 else ("tentative" if n < 80 else "ok")
+    return {
+        "n": n,
+        "mean_r": float(row[1]) if row[1] is not None else None,
+        "std_r": float(row[2]) if row[2] is not None else None,
+        "win_rate": float(row[3]) if row[3] is not None else None,
+        "note": note,
+        "regime_primary": regime_primary,
+    }
+
+
+def minutes_to_funding_hour(now: datetime) -> float:
+    """Minutes until the next funding hour boundary (spec 10 step 17)."""
+    current = require_utc(now)
+    return (60 - current.minute - current.second / 60.0) % 60
+
+
+def review_candidate(conn, *, settings, idea_id, detection, geometry, costs, gates, features,
+                     regime, ctx, book, hist_cell, portfolio, llm_client, asof: datetime):
+    """Spec 10 steps 15-18. Called ONLY when every hard gate has passed.
+
+    Returns (final_decision, reasons, llm_review_json, prompt_version_id, confidence).
+    The LLM can only hold the decision back; it can never create or widen one.
+    """
+    from agent.llm.client import persist_review
+    from agent.llm.packet import build_packet, packet_price_allowlist
+    from agent.llm.schema import final_confidence, resolve_after_llm
+
+    if not gates.passed:
+        raise AssertionError("review_candidate called with failing hard gates")
+
+    prompt_version = llm_client.prompt_version_id
+    packet = build_packet(
+        idea_id=str(idea_id), ts_utc=require_utc(asof).isoformat(), asset=detection.asset,
+        timeframe=detection.timeframe, strategy_version_id=STRATEGY_VERSION_ID,
+        prompt_version_id=prompt_version, mode="paper",
+        data_quality={"ok": True, "flags": []}, regime=regime,
+        setup={"id": detection.setup_id, "direction": detection.direction,
+               "levels": {"entry": geometry.entry, "stop": geometry.stop, "targets": list(geometry.targets)}},
+        features=features,
+        book=book or {},
+        derivatives={"funding": features.get("funding"), "funding_z_168": features.get("funding_z_168"),
+                     "oi": features.get("oi"), "oi_chg_24h": features.get("oi_chg_24h"),
+                     "basis_bps": features.get("basis_bps")},
+        costs=costs.to_dict(), portfolio=portfolio, news=[], calendar=[],
+        hist_cell=hist_cell, gates_passed=sorted(name for name, ok in gates.hard.items() if ok),
+    )
+
+    result = llm_client.review(packet)
+    try:
+        persist_review(conn, idea_id=str(idea_id), result=result)
+    except Exception:  # journaling the review must not change the decision
+        pass
+
+    outcome = resolve_after_llm(decision=result.decision, error=result.error,
+                                allowlist=packet_price_allowlist(packet))
+    reasons = list(outcome.reasons)
+    decision = outcome.decision
+
+    confidence = final_confidence(regime_confidence=float(regime.get("confidence") or 0.0),
+                                  hist_n=int(hist_cell.get("n", 0) or 0), agreement=outcome.agreement)
+    if decision == "TRADE_PAPER" and confidence < MIN_FINAL_CONFIDENCE:
+        decision = "NO_TRADE"
+        reasons.append("confidence_below_floor")
+    if decision == "TRADE_PAPER" and detection.timeframe == "15m" and minutes_to_funding_hour(asof) < FUNDING_WAIT_MINUTES:
+        decision = "WAIT"
+        reasons.append("funding_hour_imminent")
+
+    review_json = result.decision.to_dict() if result.decision else {"error": result.error}
+    review_json["resolved_decision"] = decision
+    return decision, reasons, review_json, prompt_version, confidence
+
+
+def evaluate(conn, *, settings, asset: str, timeframe: str, bar_open_time: datetime | None = None, llm_client=None) -> list[dict[str, Any]]:
     if asset not in FROZEN_ASSETS or timeframe not in FROZEN_TIMEFRAMES:
         raise ValueError("unsupported asset/timeframe")
     target = require_utc(bar_open_time or utc_now())
@@ -124,12 +222,31 @@ def evaluate(conn, *, settings, asset: str, timeframe: str, bar_open_time: datet
         detection=c["detection"]; geometry=c["geometry"]; costs=c["costs"]; gates=c["gates"]
         if len(gates.soft)>=3: c["reasons"].append("soft_gate_stack")
         idea_id=deterministic_idea_id(asset=asset,timeframe=timeframe,setup_id=detection.setup_id,direction=detection.direction,bar_open_time=target,strategy_version_id=strategy_version_id,evidence=detection.evidence)
-        packet_hash=_persist_idea(conn,idea_id=idea_id,target=target,detection=detection,geometry=geometry,costs=costs,gates=gates,features=features,regime=effective_regime,ctx=ctx,book=book,decision=c["decision"],reasons=c["reasons"],strategy_version_id=strategy_version_id)
-        results.append({"idea_id":str(idea_id),"setup_id":detection.setup_id,"direction":detection.direction,"decision":c["decision"],"planned_r_after_costs":costs.planned_r_after_costs,"packet_hash":packet_hash})
+        code_decision=c["decision"]
+        code_would_take=code_decision=="GATED_PASS"
+        decision=code_decision
+        reasons=c["reasons"]
+        llm_review=None; prompt_version_id=None; confidence=None; llm_involved=False
+        # Spec 11.1: the LLM is consulted only when every hard gate passed and the
+        # candidate is still alive. A failed gate never reaches this branch.
+        if code_would_take and llm_client is not None:
+            hist_cell=_hist_cell(conn,asset=asset,timeframe=timeframe,setup_id=detection.setup_id,regime_primary=effective_regime.get("label"))
+            portfolio={"equity":float(settings.paper_equity_usd),"open_positions":[],"day_pnl_pct":0.0,"cluster":None}
+            decision,reasons,llm_review,prompt_version_id,confidence=review_candidate(
+                conn,settings=settings,idea_id=idea_id,detection=detection,geometry=geometry,costs=costs,
+                gates=gates,features=features,regime=effective_regime,ctx=ctx,book=book,hist_cell=hist_cell,
+                portfolio=portfolio,llm_client=llm_client,asof=asof)
+            reasons=list(c["reasons"])+list(reasons)
+            llm_involved=True
+        elif code_would_take:
+            # No reviewer configured: the candidate stays gated, never auto-promoted.
+            decision="GATED_PASS"
+        packet_hash=_persist_idea(conn,idea_id=idea_id,target=target,detection=detection,geometry=geometry,costs=costs,gates=gates,features=features,regime=effective_regime,ctx=ctx,book=book,decision=decision,reasons=reasons,strategy_version_id=strategy_version_id,llm_review=llm_review,prompt_version_id=prompt_version_id,confidence=confidence,code_decision_before_llm=code_decision,code_would_take=code_would_take,llm_involved=llm_involved)
+        results.append({"idea_id":str(idea_id),"setup_id":detection.setup_id,"direction":detection.direction,"decision":decision,"code_decision_before_llm":code_decision,"planned_r_after_costs":costs.planned_r_after_costs,"packet_hash":packet_hash})
     # No scan_events table is created because §5 does not define its schema. A cell
     # with no detector is intentionally not fabricated into an idea.
     return results
 
 
-def scan_closed_bar(conn, *, settings, asset: str, timeframe: str, bar_open_time: datetime) -> list[dict[str, Any]]:
-    return evaluate(conn, settings=settings, asset=asset, timeframe=timeframe, bar_open_time=bar_open_time)
+def scan_closed_bar(conn, *, settings, asset: str, timeframe: str, bar_open_time: datetime, llm_client=None) -> list[dict[str, Any]]:
+    return evaluate(conn, settings=settings, asset=asset, timeframe=timeframe, bar_open_time=bar_open_time, llm_client=llm_client)

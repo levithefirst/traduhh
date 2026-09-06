@@ -12,6 +12,7 @@ from agent.ingest.context import fetch_contexts, upsert_contexts
 from agent.features import FeatureWarmupError, compute_and_persist_latest
 from agent.pipeline import scan_closed_bar
 from agent.integrity import inspect_latest_market_data
+from agent.llm.client import ensure_prompt_version
 from agent.models import audit_event, claim_job, finish_job, record_ctx_health, recover_running_jobs
 from agent.monitor import run_equity_snap_job, run_monitor_open_job
 from agent.timeutil import require_utc, utc_now
@@ -98,7 +99,13 @@ def run_scheduled_job(
     return True
 
 
-def _market_callbacks(settings, client):
+def _build_llm_client(settings):
+    from agent.llm.client import LLMClient
+
+    return LLMClient(base_url=settings.llm_base_url, api_key=settings.llm_api_key, model=settings.llm_model)
+
+
+def _market_callbacks(settings, client, llm_client=None):
     def ctx_poll() -> dict:
         from agent.db import connect
         with connect(settings.database_url) as conn:
@@ -127,7 +134,7 @@ def _market_callbacks(settings, client):
                         snapshot, regime = compute_and_persist_latest(conn, asset=asset, timeframe=timeframe)
                         feature_count += 1
                         regime_count += 1 if regime is not None else 0
-                        idea_count += len(scan_closed_bar(conn, settings=settings, asset=asset, timeframe=timeframe, bar_open_time=snapshot.open_time))
+                        idea_count += len(scan_closed_bar(conn, settings=settings, asset=asset, timeframe=timeframe, bar_open_time=snapshot.open_time, llm_client=llm_client))
                     except FeatureWarmupError:
                         LOGGER.info(
                             "feature_warmup_insufficient",
@@ -185,14 +192,14 @@ def _market_callbacks(settings, client):
     }
 
 
-def build_scheduler(settings, client):
-    """Build the frozen single-process APScheduler job skeleton for Step 3."""
+def build_scheduler(settings, client, llm_client=None):
+    """Build the frozen single-process APScheduler job skeleton."""
     from apscheduler.schedulers.background import BackgroundScheduler
     from apscheduler.triggers.cron import CronTrigger
     from apscheduler.triggers.interval import IntervalTrigger
 
     scheduler = BackgroundScheduler(timezone=timezone.utc, job_defaults={"coalesce": True, "max_instances": 1})
-    callbacks = _market_callbacks(settings, client)
+    callbacks = _market_callbacks(settings, client, llm_client)
 
     def add(job_name: str, trigger) -> None:
         callback = callbacks[job_name]
@@ -266,7 +273,10 @@ def main() -> int:
     from agent.hl_client import HyperliquidClient
 
     client = HyperliquidClient(settings.hl_info_url)
-    scheduler = build_scheduler(settings, client)
+    llm_client = _build_llm_client(settings)
+    with connect(settings.database_url) as conn:
+        ensure_prompt_version(conn, model=settings.llm_model)
+    scheduler = build_scheduler(settings, client, llm_client)
     scheduler.start()
     _, stop_telegram = start_telegram_listener(settings)
     try:
@@ -279,6 +289,7 @@ def main() -> int:
     finally:
         stop_telegram()
         scheduler.shutdown(wait=False)
+        llm_client.close()
         client.close()
 
 
