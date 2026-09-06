@@ -15,6 +15,7 @@ from agent.integrity import inspect_latest_market_data
 from agent.llm.client import ensure_prompt_version
 from agent.models import audit_event, claim_job, finish_job, record_ctx_health, recover_running_jobs
 from agent.monitor import run_equity_snap_job, run_monitor_open_job
+from agent.telegram.alerts import AlertDispatcher, dispatch_position_alerts, fetch_alertable_ideas
 from agent.timeutil import require_utc, utc_now
 from agent.logging_setup import configure_logging
 
@@ -105,7 +106,7 @@ def _build_llm_client(settings):
     return LLMClient(base_url=settings.llm_base_url, api_key=settings.llm_api_key, model=settings.llm_model)
 
 
-def _market_callbacks(settings, client, llm_client=None):
+def _market_callbacks(settings, client, llm_client=None, alert_dispatcher=None):
     def ctx_poll() -> dict:
         from agent.db import connect
         with connect(settings.database_url) as conn:
@@ -128,19 +129,25 @@ def _market_callbacks(settings, client, llm_client=None):
                 feature_count = 0
                 regime_count = 0
                 idea_count = 0
+                alert_count = 0
                 for asset in FROZEN_ASSETS:
                     count += upsert_candles(conn, fetch_recent_candles(client, asset, timeframe, bars=5))
                     try:
                         snapshot, regime = compute_and_persist_latest(conn, asset=asset, timeframe=timeframe)
                         feature_count += 1
                         regime_count += 1 if regime is not None else 0
-                        idea_count += len(scan_closed_bar(conn, settings=settings, asset=asset, timeframe=timeframe, bar_open_time=snapshot.open_time, llm_client=llm_client))
+                        scanned = scan_closed_bar(conn, settings=settings, asset=asset, timeframe=timeframe, bar_open_time=snapshot.open_time, llm_client=llm_client)
+                        idea_count += len(scanned)
+                        if alert_dispatcher is not None:
+                            traded = [r["idea_id"] for r in scanned if r["decision"] == "TRADE_PAPER"]
+                            for idea in fetch_alertable_ideas(conn, traded):
+                                alert_count += alert_dispatcher.alert_trade_paper(conn, idea)
                     except FeatureWarmupError:
                         LOGGER.info(
                             "feature_warmup_insufficient",
                             extra={"event": "feature_warmup_insufficient", "asset": asset, "timeframe": timeframe},
                         )
-                return {"timeframe": timeframe, "candles": count, "features": feature_count, "regimes": regime_count, "ideas": idea_count}
+                return {"timeframe": timeframe, "candles": count, "features": feature_count, "regimes": regime_count, "ideas": idea_count, "alerts": alert_count}
 
         return callback
 
@@ -173,7 +180,10 @@ def _market_callbacks(settings, client, llm_client=None):
     def monitor_open_job() -> dict:
         from agent.db import connect
         with connect(settings.database_url) as conn:
-            return run_monitor_open_job(conn, settings=settings)
+            stats = run_monitor_open_job(conn, settings=settings)
+            if alert_dispatcher is not None:
+                stats.update(dispatch_position_alerts(conn, alert_dispatcher))
+            return stats
 
     def equity_snap_job() -> dict:
         from agent.db import connect
@@ -192,14 +202,14 @@ def _market_callbacks(settings, client, llm_client=None):
     }
 
 
-def build_scheduler(settings, client, llm_client=None):
+def build_scheduler(settings, client, llm_client=None, alert_dispatcher=None):
     """Build the frozen single-process APScheduler job skeleton."""
     from apscheduler.schedulers.background import BackgroundScheduler
     from apscheduler.triggers.cron import CronTrigger
     from apscheduler.triggers.interval import IntervalTrigger
 
     scheduler = BackgroundScheduler(timezone=timezone.utc, job_defaults={"coalesce": True, "max_instances": 1})
-    callbacks = _market_callbacks(settings, client, llm_client)
+    callbacks = _market_callbacks(settings, client, llm_client, alert_dispatcher)
 
     def add(job_name: str, trigger) -> None:
         callback = callbacks[job_name]
@@ -268,15 +278,19 @@ def main() -> int:
         recovered = recover_running_jobs(conn)
     LOGGER.info("startup_ok", extra={"event": "startup_ok", "migrations_applied": applied, "recovered_jobs": recovered})
 
-    # Market-data/integrity (Step 3) and paper monitoring (Step 6) share this one
-    # worker/scheduler. Telegram and LLM jobs are not registered yet.
+    # Market data, integrity, paper monitoring, LLM review, the Telegram
+    # listener and alert dispatch all share this one worker process.
     from agent.hl_client import HyperliquidClient
 
     client = HyperliquidClient(settings.hl_info_url)
     llm_client = _build_llm_client(settings)
     with connect(settings.database_url) as conn:
         ensure_prompt_version(conn, model=settings.llm_model)
-    scheduler = build_scheduler(settings, client, llm_client)
+    from agent.telegram.bot import TelegramTransport
+
+    alert_transport = TelegramTransport(settings.telegram_bot_token)
+    alert_dispatcher = AlertDispatcher(settings, sender=alert_transport.send_message)
+    scheduler = build_scheduler(settings, client, llm_client, alert_dispatcher)
     scheduler.start()
     _, stop_telegram = start_telegram_listener(settings)
     try:
@@ -288,6 +302,7 @@ def main() -> int:
         return 0
     finally:
         stop_telegram()
+        alert_transport.close()
         scheduler.shutdown(wait=False)
         llm_client.close()
         client.close()

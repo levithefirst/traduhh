@@ -163,6 +163,79 @@ def format_version(version: Mapping[str, Any]) -> str:
     ])
 
 
+def format_trade_paper_alert(idea: Mapping[str, Any]) -> str:
+    """The frozen 12.3 alert body. Paper only; nothing here is an order."""
+    geometry = idea.get("geometry") or {}
+    costs = idea.get("costs") or {}
+    regime = idea.get("regime") or {}
+    hist = idea.get("hist_cell") or {}
+    llm = idea.get("llm_review") or {}
+    features = idea.get("features") or {}
+    targets = geometry.get("targets") or []
+    risk_cash = float(geometry.get("risk_cash") or 0) or None
+    secondary = ", ".join(regime.get("secondary") or []) or "-"
+
+    def in_r(value):
+        if risk_cash is None or value is None:
+            return "n/a"
+        return f"{float(value) / risk_cash:.2f}R"
+
+    hist_n = int(hist.get("n", 0) or 0)
+    hist_mean = hist.get("mean_r")
+    hist_text = f"n={hist_n} meanR={'n/a' if hist_mean is None else _num(hist_mean)} ({hist.get('note', 'unproven')})"
+
+    lines = [
+        f"TITLE: PAPER | {idea.get('asset')} | {idea.get('timeframe')} | {idea.get('setup_id')} | "
+        f"{str(idea.get('direction', '')).upper()}",
+        f"DECISION: TRADE_PAPER | planned R after costs: {_num(costs.get('planned_r_after_costs'))}",
+        f"ENTRY / STOP / T1: {_num(geometry.get('entry'), 4)} / {_num(geometry.get('stop'), 4)} / "
+        f"{_num(targets[0] if targets else None, 4)}",
+        f"REGIME: {regime.get('label', 'n/a')} + {secondary} | ADX {_num(features.get('adx_14'), 1)} | "
+        f"ATR% {_num(features.get('atr_pct_100'), 2)}",
+        f"COST: fee {in_r(costs.get('fee_round_trip'))} slip {in_r(costs.get('slip_cost_rt'))} "
+        f"funding {in_r(costs.get('funding_est'))}",
+        "GATES: all hard passed",
+        f"HIST: {hist_text}",
+    ]
+    if llm:
+        lines.append(
+            f"LLM: {llm.get('recommendation', 'n/a')} agree={llm.get('agree_with_code', 'n/a')} "
+            f"conf={_num(llm.get('confidence'))}"
+        )
+        if llm.get("thesis"):
+            lines.append(f"THESIS: {llm['thesis']}")
+    lines.append(
+        f"ID: {idea.get('id')} | sv={idea.get('strategy_version_id')} pv={idea.get('prompt_version_id') or 'n/a'}"
+    )
+    return "\n".join(lines)
+
+
+def format_fill_alert(position: Mapping[str, Any]) -> str:
+    return "\n".join([
+        f"PAPER FILL | {position.get('asset')} | {position.get('tf')} | "
+        f"{str(position.get('direction', '')).upper()}",
+        f"ENTRY FILL: {_num(position.get('entry'), 4)} | SIZE: {_num(position.get('size'), 6)}",
+        f"STOP: {_num(position.get('stop'), 4)} | RISK: {_num(position.get('risk_cash'))} USD",
+        "Hypothetical paper fill. No exchange order was placed.",
+        f"POSITION: {position.get('id')} | IDEA: {position.get('idea_id')}",
+    ])
+
+
+def format_close_alert(position: Mapping[str, Any]) -> str:
+    return "\n".join([
+        f"PAPER CLOSE | {position.get('asset')} | {position.get('tf')} | "
+        f"{str(position.get('direction', '')).upper()}",
+        f"EXIT: {_num(position.get('exit_px'), 4)} ({position.get('exit_reason')})",
+        f"REALIZED R: {_num(position.get('realized_r'))} | PnL: {_num(position.get('pnl_usd'))} USD",
+        f"MFE {_num(position.get('mfe_r'))}R / MAE {_num(position.get('mae_r'))}R | "
+        f"bars {position.get('bars_held', 0)}",
+        f"FEES: {_num(position.get('fees_usd'))} | FUNDING: {_num(position.get('funding_usd'))}"
+        + (" (incomplete funding data)" if position.get("funding_missing") else ""),
+        f"CLASS: {position.get('outcome_class')}",
+        f"POSITION: {position.get('id')} | IDEA: {position.get('idea_id')}",
+    ])
+
+
 def format_mode(mode: str) -> str:
     return "\n".join([
         f"MODE: {mode}",
