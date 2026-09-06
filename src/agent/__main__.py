@@ -47,6 +47,8 @@ def scheduled_for(job_name: str, now: datetime | None = None) -> datetime:
         return _slot(current, 15)
     if job_name == "equity_snap":
         return current.replace(second=0, microsecond=0)
+    if job_name == "daily_stats":
+        return current.replace(hour=0, minute=5, second=0, microsecond=0)
     raise ValueError(f"unsupported scheduler job: {job_name}")
 
 
@@ -190,6 +192,12 @@ def _market_callbacks(settings, client, llm_client=None, alert_dispatcher=None):
         with connect(settings.database_url) as conn:
             return run_equity_snap_job(conn, settings=settings)
 
+    def daily_stats_job() -> dict:
+        from agent.db import connect
+        from agent.learning import run_learning_job
+        with connect(settings.database_url) as conn:
+            return run_learning_job(conn, settings=settings)
+
     return {
         "ctx_poll": ctx_poll,
         "book_poll": book_poll,
@@ -199,6 +207,7 @@ def _market_callbacks(settings, client, llm_client=None, alert_dispatcher=None):
         "integrity": integrity_job,
         "monitor_open": monitor_open_job,
         "equity_snap": equity_snap_job,
+        "daily_stats": daily_stats_job,
     }
 
 
@@ -230,6 +239,7 @@ def build_scheduler(settings, client, llm_client=None, alert_dispatcher=None):
     add("integrity", IntervalTrigger(seconds=30, timezone=timezone.utc))
     add("monitor_open", IntervalTrigger(seconds=15, timezone=timezone.utc))
     add("equity_snap", IntervalTrigger(seconds=60, timezone=timezone.utc))
+    add("daily_stats", CronTrigger(hour=0, minute=5, timezone=timezone.utc))
     return scheduler
 
 
